@@ -362,3 +362,179 @@ class TestOnUsageCallback:
         assert body == chunks
         resp_mock.aclose.assert_awaited()
         client.aclose.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Multi-level override failover
+# ---------------------------------------------------------------------------
+
+class TestMultiLevelFailover:
+    @pytest.mark.asyncio
+    async def test_fails_over_to_next_candidate_on_non_200(self):
+        import kiro.nine_router_client as mod
+
+        # First candidate returns 503, second returns 200 streaming.
+        resp_fail = _mock_stream_response(503)
+        resp_ok = _mock_stream_response(200, chunks=[b'data: {"model":"good-model"}\n\n', b"data: [DONE]\n\n"])
+        client = _mock_client(send_side_effect=[resp_fail, resp_ok])
+
+        body = b'{"model":"gpt-4","messages":[]}'
+        rules = [{"from": "gpt", "to": ["bad-model", "good-model"]}]
+
+        with (
+            patch.object(mod, "NINE_ROUTER_URL", "http://ninerouter:20128"),
+            patch.object(mod, "_get_nine_router_override", AsyncMock(return_value=(True, rules, "auto"))),
+            patch("kiro.nine_router_client.httpx.AsyncClient", return_value=client),
+        ):
+            req = _mock_request()
+            resp = await mod.forward_to_nine_router(req, body)
+            assert isinstance(resp, StreamingResponse)
+            assert resp.status_code == 200
+
+        # Two send attempts: first rewritten to "bad-model", second to "good-model".
+        assert client.send.await_count == 2
+        sent_contents = [c.kwargs["content"] for c in client.build_request.call_args_list]
+        assert b'"model":"bad-model"' in sent_contents[0]
+        assert b'"model":"good-model"' in sent_contents[1]
+
+    @pytest.mark.asyncio
+    async def test_all_candidates_failed_returns_last_error(self):
+        import kiro.nine_router_client as mod
+
+        resp_fail1 = _mock_stream_response(502)
+        resp_fail2 = _mock_stream_response(503)
+        client = _mock_client(send_side_effect=[resp_fail1, resp_fail2])
+
+        body = b'{"model":"gpt-4","messages":[]}'
+        rules = [{"from": "gpt", "to": ["bad-model", "worse-model"]}]
+
+        with (
+            patch.object(mod, "NINE_ROUTER_URL", "http://ninerouter:20128"),
+            patch.object(mod, "_get_nine_router_override", AsyncMock(return_value=(True, rules, "auto"))),
+            patch("kiro.nine_router_client.httpx.AsyncClient", return_value=client),
+        ):
+            req = _mock_request()
+            resp = await mod.forward_to_nine_router(req, body)
+            assert isinstance(resp, JSONResponse)
+            assert resp.status_code == 503  # last candidate's status
+
+        assert client.send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_string_rule_still_single_attempt(self):
+        import kiro.nine_router_client as mod
+
+        resp_ok = _mock_stream_response(200)
+        client = _mock_client(response=resp_ok)
+        body = b'{"model":"gpt-4","messages":[]}'
+        rules = [{"from": "gpt", "to": "good-model"}]
+
+        with (
+            patch.object(mod, "NINE_ROUTER_URL", "http://ninerouter:20128"),
+            patch.object(mod, "_get_nine_router_override", AsyncMock(return_value=(True, rules, "auto"))),
+            patch("kiro.nine_router_client.httpx.AsyncClient", return_value=client),
+        ):
+            req = _mock_request()
+            resp = await mod.forward_to_nine_router(req, body)
+            assert isinstance(resp, StreamingResponse)
+
+        assert client.send.await_count == 1
+        assert b'"model":"good-model"' in client.build_request.call_args_list[0].kwargs["content"]
+
+    @pytest.mark.asyncio
+    async def test_usage_callback_fires_once_for_winning_candidate(self):
+        import kiro.nine_router_client as mod
+
+        resp_fail = _mock_stream_response(500)
+        resp_ok = _mock_stream_response(
+            200,
+            chunks=[b'data: {"model":"good-model","usage":{"prompt_tokens":5,"completion_tokens":3}}\n\n', b"data: [DONE]\n\n"],
+        )
+        client = _mock_client(send_side_effect=[resp_fail, resp_ok])
+        body = b'{"model":"gpt-4","messages":[]}'
+        rules = [{"from": "gpt", "to": ["bad-model", "good-model"]}]
+        seen = {}
+
+        async def on_usage(it, ot, model):
+            seen["input"], seen["output"], seen["model"] = it, ot, model
+
+        with (
+            patch.object(mod, "NINE_ROUTER_URL", "http://ninerouter:20128"),
+            patch.object(mod, "_get_nine_router_override", AsyncMock(return_value=(True, rules, "auto"))),
+            patch("kiro.nine_router_client.httpx.AsyncClient", return_value=client),
+        ):
+            req = _mock_request()
+            resp = await mod.forward_to_nine_router(req, body, on_usage=on_usage)
+            await _drain(resp)
+
+        assert seen == {"input": 5, "output": 3, "model": "good-model"}
+
+
+# ---------------------------------------------------------------------------
+# Direct-to-9router mode toggle
+# ---------------------------------------------------------------------------
+
+class TestIsNineRouterDirectEnabled:
+    @pytest.mark.asyncio
+    async def test_db_key_true(self):
+        import kiro.nine_router_client as mod
+        mod.invalidate_nine_router_direct_cache()
+
+        mock_factory = MagicMock()
+        mock_factory.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
+        mock_factory.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("kiro.db.engine.async_session_factory", mock_factory),
+            patch("kiro.db.repositories.get_config", AsyncMock(return_value="true")),
+        ):
+            assert await mod.is_nine_router_direct_enabled() is True
+
+    @pytest.mark.asyncio
+    async def test_db_key_false(self):
+        import kiro.nine_router_client as mod
+        mod.invalidate_nine_router_direct_cache()
+
+        mock_factory = MagicMock()
+        mock_factory.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
+        mock_factory.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        with (
+            patch("kiro.db.engine.async_session_factory", mock_factory),
+            patch("kiro.db.repositories.get_config", AsyncMock(return_value="false")),
+        ):
+            assert await mod.is_nine_router_direct_enabled() is False
+
+    @pytest.mark.asyncio
+    async def test_db_unavailable_falls_back_to_env(self):
+        import kiro.nine_router_client as mod
+        mod.invalidate_nine_router_direct_cache()
+
+        with (
+            patch("kiro.db.engine.async_session_factory", MagicMock(side_effect=Exception("no db"))),
+            patch.object(mod, "ENABLE_NINE_ROUTER_DIRECT", True),
+        ):
+            assert await mod.is_nine_router_direct_enabled() is True
+
+    @pytest.mark.asyncio
+    async def test_cache_invalidation_forces_refetch(self):
+        import kiro.nine_router_client as mod
+        mod.invalidate_nine_router_direct_cache()
+
+        mock_factory = MagicMock()
+        mock_factory.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
+        mock_factory.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        get_config = AsyncMock(side_effect=["true", "false"])
+        with (
+            patch("kiro.db.engine.async_session_factory", mock_factory),
+            patch("kiro.db.repositories.get_config", get_config),
+        ):
+            assert await mod.is_nine_router_direct_enabled() is True
+            # Cached — second call does not hit DB again.
+            assert await mod.is_nine_router_direct_enabled() is True
+            assert get_config.await_count == 1
+            # Invalidate forces a refetch.
+            mod.invalidate_nine_router_direct_cache()
+            assert await mod.is_nine_router_direct_enabled() is False
+            assert get_config.await_count == 2

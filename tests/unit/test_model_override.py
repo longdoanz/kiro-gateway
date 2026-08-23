@@ -18,6 +18,8 @@ import pytest
 from kiro.model_override import (
     OverrideConfig,
     resolve_model,
+    resolve_models,
+    _normalize_targets,
     get_override_config,
     invalidate_cache,
     _fetch_override_config,
@@ -111,6 +113,72 @@ class TestResolveModel:
         cfg = OverrideConfig(enabled=True, rules=[{"from": "opus", "to": "GLM5"}],
                              default_model="auto", has_default=False)
         assert resolve_model("claude-haiku-4.5", cfg) == "claude-haiku-4.5"
+
+
+# =============================================================================
+# resolve_models — multi-level failover candidates
+# =============================================================================
+
+class TestResolveModels:
+    def test_disabled_config_is_single_passthrough(self):
+        cfg = OverrideConfig(enabled=False, rules=[{"from": "opus", "to": ["a", "b"]}], default_model="deepseek")
+        assert resolve_models("claude-opus-4.7", cfg) == ["claude-opus-4.7"]
+
+    def test_string_to_yields_single_candidate(self):
+        cfg = OverrideConfig(enabled=True, rules=[{"from": "opus", "to": "GLM5"}], default_model="auto")
+        assert resolve_models("claude-opus-4.7", cfg) == ["GLM5"]
+
+    def test_list_to_yields_ordered_candidates(self):
+        cfg = OverrideConfig(enabled=True, rules=[{"from": "opus", "to": ["GLM5", "deepseek", "sonnet"]}], default_model="auto")
+        assert resolve_models("claude-opus-4.7", cfg) == ["GLM5", "deepseek", "sonnet"]
+
+    def test_list_to_filters_empty_and_whitespace(self):
+        cfg = OverrideConfig(enabled=True, rules=[{"from": "opus", "to": ["GLM5", "", "  ", "deepseek"]}], default_model="auto")
+        assert resolve_models("claude-opus-4.7", cfg) == ["GLM5", "deepseek"]
+
+    def test_no_rule_default_yields_single_candidate(self):
+        cfg = OverrideConfig(enabled=True, rules=[], default_model="deepseek")
+        assert resolve_models("claude-opus-4.7", cfg) == ["deepseek"]
+
+    def test_no_rule_auto_has_default_yields_auto(self):
+        cfg = OverrideConfig(enabled=True, rules=[], default_model="auto", has_default=True)
+        assert resolve_models("claude-haiku-4.5", cfg) == ["auto"]
+
+    def test_no_rule_auto_no_has_default_passthrough(self):
+        cfg = OverrideConfig(enabled=True, rules=[], default_model="auto", has_default=False)
+        assert resolve_models("claude-haiku-4.5", cfg) == ["claude-haiku-4.5"]
+
+    def test_first_matching_rule_wins_for_multi_level(self):
+        cfg = OverrideConfig(enabled=True, rules=[
+            {"from": "opus", "to": ["GLM5", "deepseek"]},
+            {"from": "claude", "to": ["other"]},
+        ], default_model="auto")
+        assert resolve_models("claude-opus-4.7", cfg) == ["GLM5", "deepseek"]
+
+    def test_resolve_model_is_first_candidate(self):
+        cfg = OverrideConfig(enabled=True, rules=[{"from": "opus", "to": ["GLM5", "deepseek"]}], default_model="auto")
+        assert resolve_model("claude-opus-4.7", cfg) == "GLM5"
+
+
+# =============================================================================
+# _normalize_targets — legacy string vs list normalization
+# =============================================================================
+
+class TestNormalizeTargets:
+    def test_string_target(self):
+        assert _normalize_targets({"to": "glm-5"}) == ["glm-5"]
+
+    def test_list_target(self):
+        assert _normalize_targets({"to": ["a", "b"]}) == ["a", "b"]
+
+    def test_missing_to_returns_empty(self):
+        assert _normalize_targets({"from": "opus"}) == []
+
+    def test_empty_string_dropped(self):
+        assert _normalize_targets({"to": ""}) == []
+
+    def test_non_string_list_entries_dropped(self):
+        assert _normalize_targets({"to": ["a", 3, None, "b"]}) == ["a", "b"]
 
 
 # =============================================================================

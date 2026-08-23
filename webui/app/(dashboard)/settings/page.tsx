@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Save, RefreshCw, Trash2, Plus, Key, ArrowRight, Pencil, List } from "lucide-react";
+import { Save, RefreshCw, Trash2, Plus, Key, ArrowRight, Pencil, List, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -390,6 +390,33 @@ function ModelOverrideSection({
     onRulesChange(updated);
   }
 
+  // Normalize a rule's `to` into an array of fallback targets (ordered).
+  function targetsOf(rule: ModelOverrideRule): string[] {
+    return Array.isArray(rule.to) ? rule.to : [rule.to];
+  }
+
+  function setTargets(index: number, targets: string[]) {
+    const updated = rules.map((r, i) => (i === index ? { ...r, to: targets.length === 1 ? targets[0] : targets } : r));
+    onRulesChange(updated);
+  }
+
+  function addTarget(index: number) {
+    const targets = targetsOf(rules[index]);
+    setTargets(index, [...targets, "auto"]);
+  }
+
+  function updateTarget(index: number, targetIndex: number, value: string) {
+    const targets = targetsOf(rules[index]);
+    const next = targets.map((t, i) => (i === targetIndex ? value : t));
+    setTargets(index, next);
+  }
+
+  function removeTarget(index: number, targetIndex: number) {
+    const targets = targetsOf(rules[index]);
+    if (targets.length <= 1) return;
+    setTargets(index, targets.filter((_, i) => i !== targetIndex));
+  }
+
   function removeRule(index: number) {
     onRulesChange(rules.filter((_, i) => i !== index));
   }
@@ -429,6 +456,7 @@ function ModelOverrideSection({
             </div>
             <p className="text-xs text-on-surface-variant">
               First matching rule wins. &quot;From&quot; is matched as a substring of the normalized model name.
+              Each rule&apos;s targets are tried in order on failure.
             </p>
 
             {rules.length === 0 ? (
@@ -438,7 +466,7 @@ function ModelOverrideSection({
             ) : (
               <div className="space-y-2 mt-2">
                 {rules.map((rule, i) => (
-                  <div key={i} className="flex items-center gap-2">
+                  <div key={i} className="flex flex-wrap items-center gap-2">
                     <span className="text-xs text-on-surface-variant w-5 text-right shrink-0">{i + 1}.</span>
                     <ModelSelect
                       value={rule.from}
@@ -448,13 +476,38 @@ function ModelOverrideSection({
                       allowFreeText
                     />
                     <ArrowRight className="w-4 h-4 text-on-surface-variant shrink-0" />
-                    <ModelSelect
-                      value={rule.to}
-                      onChange={(v) => updateRule(i, "to", v)}
-                      modelIds={modelIds}
-                      placeholder="Replace with..."
-                      allowFreeText
-                    />
+                    <div className="flex items-center gap-1">
+                      {targetsOf(rule).map((target, ti) => (
+                        <div key={ti} className="flex items-center gap-1">
+                          {ti > 0 && <ArrowRight className="w-3 h-3 text-on-surface-variant/60 shrink-0" />}
+                          <ModelSelect
+                            value={target}
+                            onChange={(v) => updateTarget(i, ti, v)}
+                            modelIds={modelIds}
+                            placeholder="Replace with..."
+                            allowFreeText
+                          />
+                          {targetsOf(rule).length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => removeTarget(i, ti)}
+                              className="text-on-surface-variant hover:text-error transition-colors p-1 shrink-0"
+                              title="Remove fallback target"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() => addTarget(i)}
+                        className="text-on-surface-variant hover:text-primary transition-colors p-1 shrink-0"
+                        title="Add fallback target"
+                      >
+                        <Plus className="w-3 h-3" />
+                      </button>
+                    </div>
                     <button
                       onClick={() => removeRule(i)}
                       className="text-on-surface-variant hover:text-error transition-colors p-1 shrink-0"
@@ -484,6 +537,7 @@ export default function SettingsPage() {
   const [enableNineRouterModelOverride, setEnableNineRouterModelOverride] = useState(false);
   const [nineRouterOverrideRules, setNineRouterOverrideRules] = useState<ModelOverrideRule[]>([]);
   const [nineRouterDefaultModel, setNineRouterDefaultModel] = useState("auto");
+  const [enableNineRouterDirect, setEnableNineRouterDirect] = useState(false);
   const [dirty, setDirty] = useState(false);
 
   const modelIds = (modelsData?.models ?? []).map((m) => m.id);
@@ -497,6 +551,7 @@ export default function SettingsPage() {
       setEnableNineRouterModelOverride(config.enable_nine_router_model_override ?? false);
       setNineRouterOverrideRules(config.nine_router_model_override_rules ?? []);
       setNineRouterDefaultModel(config.nine_router_model_override_default ?? "auto");
+      setEnableNineRouterDirect(config.enable_nine_router_direct ?? false);
       setDirty(false);
     }
   }, [config]);
@@ -517,6 +572,7 @@ export default function SettingsPage() {
       enable_nine_router_model_override: enableNineRouterModelOverride,
       nine_router_model_override_rules: nineRouterOverrideRules,
       nine_router_model_override_default: nineRouterDefaultModel,
+      enable_nine_router_direct: enableNineRouterDirect,
     });
     setDirty(false);
   }
@@ -570,6 +626,25 @@ export default function SettingsPage() {
           <Switch
             checked={enableUsageSharing}
             onCheckedChange={handleChange(setEnableUsageSharing)}
+          />
+        </div>
+      </div>
+
+      {/* 9Router Direct Mode Section */}
+      <div className="glass-panel rounded-3xl p-8 md:p-10 group relative overflow-hidden">
+        <div className="absolute inset-0 bg-gradient-to-br from-white/40 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none" />
+        <div className="flex items-start justify-between">
+          <div>
+            <h3 className="text-lg font-semibold text-on-surface">Use 9router directly</h3>
+            <p className="text-sm text-on-surface-variant mt-1 max-w-lg">
+              When enabled, every API request is forwarded straight to 9router, bypassing the Kiro
+              account/key pool entirely. The 9Router Model Override rules below still apply on the
+              forwarded requests.
+            </p>
+          </div>
+          <Switch
+            checked={enableNineRouterDirect}
+            onCheckedChange={handleChange(setEnableNineRouterDirect)}
           />
         </div>
       </div>

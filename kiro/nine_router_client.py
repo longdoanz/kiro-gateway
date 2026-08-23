@@ -21,7 +21,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
-from kiro.config import NINE_ROUTER_API_KEY, NINE_ROUTER_URL
+from kiro.config import ENABLE_NINE_ROUTER_DIRECT, NINE_ROUTER_API_KEY, NINE_ROUTER_URL
 
 # ---------------------------------------------------------------------------
 # 9router model override — own config (toggle, rules, default), cached in-process
@@ -62,10 +62,40 @@ def _rewrite_model_in_body(body: bytes, override_model: str) -> bytes:
         parsed = json.loads(body)
         if isinstance(parsed, dict) and "model" in parsed:
             parsed["model"] = override_model
-            return json.dumps(parsed).encode()
+            return json.dumps(parsed, separators=(",", ":")).encode()
     except Exception:
         pass
     return body
+
+
+# ---------------------------------------------------------------------------
+# 9router direct mode — global toggle routing every request straight to 9router
+# ---------------------------------------------------------------------------
+_nine_router_direct_cache: bool | None = None
+
+
+def invalidate_nine_router_direct_cache() -> None:
+    global _nine_router_direct_cache
+    _nine_router_direct_cache = None
+
+
+async def is_nine_router_direct_enabled() -> bool:
+    """Return True when direct-to-9router mode is enabled (DB key, env fallback)."""
+    global _nine_router_direct_cache
+    if _nine_router_direct_cache is not None:
+        return _nine_router_direct_cache
+    result = False
+    try:
+        from kiro.db.engine import async_session_factory
+        from kiro.db.repositories import get_config
+        async with async_session_factory() as session:
+            enabled_raw = await get_config(session, "enable_nine_router_direct") or ""
+        result = enabled_raw.lower() == "true"
+    except Exception:
+        # DB unavailable — fall back to the environment flag.
+        result = ENABLE_NINE_ROUTER_DIRECT
+    _nine_router_direct_cache = result
+    return result
 
 # Headers that must not be forwarded upstream
 _HOP_BY_HOP = frozenset({
@@ -197,23 +227,30 @@ async def forward_to_nine_router(
     if original_request.url.query:
         target_url += f"?{original_request.url.query}"
 
-    # Apply 9router's own model override (independent of Global Model Enforcement)
+    # Apply 9router's own model override (independent of Global Model Enforcement).
+    # Returns an ordered list of candidate models — a multi-level override yields
+    # several targets tried in order, with the default (when configured) as the
+    # final level. `candidates` is a list of Optional[str]: None means "send the
+    # original body untouched" (no model key to rewrite).
     enabled, rules, default_model = await _get_nine_router_override()
-    if enabled:
-        original_model = None
-        try:
-            parsed = json.loads(body)
+    original_model: Optional[str] = None
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
             original_model = parsed.get("model")
-        except Exception:
-            pass
-        if original_model:
-            from kiro.model_override import OverrideConfig, resolve_model
-            # 9router treats "auto" as a real model name, so a configured default
-            # (even "auto") must be enforced via has_default.
-            config = OverrideConfig(enabled=True, rules=rules, default_model=default_model, has_default=True)
-            new_model = resolve_model(original_model, config)
-            body = _rewrite_model_in_body(body, new_model)
-            logger.info(f"9router model override: {original_model!r} → {new_model!r}")
+    except Exception:
+        pass
+
+    if original_model and enabled:
+        from kiro.model_override import OverrideConfig, resolve_models
+        # 9router treats "auto" as a real model name, so a configured default
+        # (even "auto") must be enforced via has_default.
+        config = OverrideConfig(enabled=True, rules=rules, default_model=default_model, has_default=True)
+        candidates: list[Optional[str]] = resolve_models(original_model, config)
+        if candidates != [original_model]:
+            logger.info(f"9router model override: {original_model!r} → {candidates}")
+    else:
+        candidates = [original_model]
 
     headers = _build_headers(original_request)
     logger.info(f"9router fallback: forwarding {original_request.method} {target_path}")
@@ -237,86 +274,109 @@ async def forward_to_nine_router(
         if owns_client:
             await client.aclose()
 
-    try:
-        response = await client.send(
-            client.build_request(
-                method=original_request.method,
-                url=target_url,
-                headers=headers,
-                content=body,
-            ),
-            stream=True,
-        )
-    except httpx.ConnectError as exc:
-        await _maybe_close_client()
-        logger.error(f"9router fallback: connection failed to {NINE_ROUTER_URL}: {exc}")
-        return JSONResponse(
-            status_code=503,
-            content={"error": {"message": f"9router fallback unavailable: {exc}", "type": "service_unavailable"}},
-        )
-    except httpx.TimeoutException as exc:
-        await _maybe_close_client()
-        logger.error(f"9router fallback: timeout: {exc}")
-        return JSONResponse(
-            status_code=504,
-            content={"error": {"message": "9router fallback timed out.", "type": "timeout"}},
-        )
-    except Exception as exc:
-        await _maybe_close_client()
-        logger.error(f"9router fallback: unexpected error: {exc}")
-        return JSONResponse(
-            status_code=502,
-            content={"error": {"message": f"9router fallback error: {exc}", "type": "bad_gateway"}},
-        )
-
-    upstream_headers = {
-        k: v for k, v in response.headers.items()
-        if k.lower() not in _HOP_BY_HOP
-    }
-
-    if response.status_code != 200:
-        error_body = await response.aread()
-        await response.aclose()
-        await _maybe_close_client()
-        logger.warning(f"9router fallback returned {response.status_code}: {error_body[:200]}")
-        return JSONResponse(
-            status_code=response.status_code,
-            content={"error": {"message": error_body.decode("utf-8", errors="replace"), "type": "nine_router_error"}},
-        )
-
-    async def _stream_and_close() -> AsyncIterator[bytes]:
-        token_counts = {"input": 0, "output": 0}
-        model_box: list = [None]
+    # Try each candidate in order; on a pre-stream failure advance to the next.
+    # Once the upstream accepts a candidate (2xx), stream it back and stop —
+    # partial bytes must not be retried.
+    last_error: JSONResponse | None = None
+    for idx, candidate in enumerate(candidates):
+        request_body = _rewrite_model_in_body(body, candidate) if candidate is not None else body
         try:
-            async for chunk in response.aiter_bytes():
-                yield chunk
-                if on_usage is not None and chunk:
-                    # Cheap byte-level gate before the UTF-8 decode on the hot path.
-                    # OpenAI repeats "model" in every SSE delta, so once we have the
-                    # model we only look for "usage" (final chunk) to avoid decoding
-                    # every chunk.
-                    want_model = model_box[0] is None
-                    has_usage = b'"usage"' in chunk
-                    if has_usage or (want_model and b'"model"' in chunk):
-                        text = chunk.decode("utf-8", errors="ignore")
-                        if text:
-                            _accumulate_usage_from_chunk(text, token_counts, model_box)
-        finally:
-            # aclose() returns the connection to the shared pool; the client itself
-            # is only closed when we privately own it.
-            await response.aclose()
-            await _maybe_close_client()
-            if on_usage is not None:
-                try:
-                    await asyncio.shield(
-                        on_usage(token_counts["input"], token_counts["output"], model_box[0] or "unknown")
-                    )
-                except Exception as exc:  # never let tracking break the stream
-                    logger.debug(f"9router usage callback failed: {exc}")
+            response = await client.send(
+                client.build_request(
+                    method=original_request.method,
+                    url=target_url,
+                    headers=headers,
+                    content=request_body,
+                ),
+                stream=True,
+            )
+        except httpx.ConnectError as exc:
+            logger.error(f"9router fallback: connection failed to {NINE_ROUTER_URL}: {exc}")
+            last_error = JSONResponse(
+                status_code=503,
+                content={"error": {"message": f"9router fallback unavailable: {exc}", "type": "service_unavailable"}},
+            )
+        except httpx.TimeoutException as exc:
+            logger.error(f"9router fallback: timeout: {exc}")
+            last_error = JSONResponse(
+                status_code=504,
+                content={"error": {"message": "9router fallback timed out.", "type": "timeout"}},
+            )
+        except Exception as exc:
+            logger.error(f"9router fallback: unexpected error: {exc}")
+            last_error = JSONResponse(
+                status_code=502,
+                content={"error": {"message": f"9router fallback error: {exc}", "type": "bad_gateway"}},
+            )
 
-    return StreamingResponse(
-        _stream_and_close(),
-        status_code=response.status_code,
-        headers=upstream_headers,
-        media_type=response.headers.get("content-type", "text/event-stream"),
+        if last_error is not None:
+            has_more = idx < len(candidates) - 1
+            if has_more:
+                logger.info(f"9router override failover: {candidate!r} failed, trying next candidate")
+                last_error = None  # reset for the next iteration
+                continue
+            await _maybe_close_client()
+            return last_error
+
+        upstream_headers = {
+            k: v for k, v in response.headers.items()
+            if k.lower() not in _HOP_BY_HOP
+        }
+
+        if response.status_code != 200:
+            error_body = await response.aread()
+            await response.aclose()
+            logger.warning(f"9router fallback returned {response.status_code}: {error_body[:200]}")
+            if idx < len(candidates) - 1:
+                logger.info(f"9router override failover: {candidate!r} failed ({response.status_code}), trying next candidate")
+                continue
+            await _maybe_close_client()
+            return JSONResponse(
+                status_code=response.status_code,
+                content={"error": {"message": error_body.decode("utf-8", errors="replace"), "type": "nine_router_error"}},
+            )
+
+        async def _stream_and_close() -> AsyncIterator[bytes]:
+            token_counts = {"input": 0, "output": 0}
+            model_box: list = [None]
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+                    if on_usage is not None and chunk:
+                        # Cheap byte-level gate before the UTF-8 decode on the hot path.
+                        # OpenAI repeats "model" in every SSE delta, so once we have the
+                        # model we only look for "usage" (final chunk) to avoid decoding
+                        # every chunk.
+                        want_model = model_box[0] is None
+                        has_usage = b'"usage"' in chunk
+                        if has_usage or (want_model and b'"model"' in chunk):
+                            text = chunk.decode("utf-8", errors="ignore")
+                            if text:
+                                _accumulate_usage_from_chunk(text, token_counts, model_box)
+            finally:
+                # aclose() returns the connection to the shared pool; the client itself
+                # is only closed when we privately own it.
+                await response.aclose()
+                await _maybe_close_client()
+                if on_usage is not None:
+                    try:
+                        await asyncio.shield(
+                            on_usage(token_counts["input"], token_counts["output"], model_box[0] or "unknown")
+                        )
+                    except Exception as exc:  # never let tracking break the stream
+                        logger.debug(f"9router usage callback failed: {exc}")
+
+        return StreamingResponse(
+            _stream_and_close(),
+            status_code=response.status_code,
+            headers=upstream_headers,
+            media_type=response.headers.get("content-type", "text/event-stream"),
+        )
+
+    # All candidates exhausted (unreachable in practice — the loop returns within
+    # each branch) — safety net returning the last observed error.
+    await _maybe_close_client()
+    return last_error or JSONResponse(
+        status_code=502,
+        content={"error": {"message": "9router fallback: all candidates failed.", "type": "bad_gateway"}},
     )

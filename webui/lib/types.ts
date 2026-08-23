@@ -139,7 +139,7 @@ export interface OverviewResponse {
 
 export interface ModelOverrideRule {
   from: string;
-  to: string;
+  to: string | string[];
 }
 
 export interface SystemConfigResponse {
@@ -150,6 +150,7 @@ export interface SystemConfigResponse {
   enable_nine_router_model_override: boolean;
   nine_router_model_override_rules: ModelOverrideRule[];
   nine_router_model_override_default: string;
+  enable_nine_router_direct: boolean;
 }
 
 export interface SystemConfigUpdate {
@@ -160,6 +161,7 @@ export interface SystemConfigUpdate {
   enable_nine_router_model_override?: boolean;
   nine_router_model_override_rules?: ModelOverrideRule[];
   nine_router_model_override_default?: string;
+  enable_nine_router_direct?: boolean;
 }
 
 // --- Models ---

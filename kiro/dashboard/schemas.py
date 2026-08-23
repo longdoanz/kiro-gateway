@@ -144,7 +144,7 @@ class OverviewResponse(BaseModel):
 
 class ModelOverrideRule(BaseModel):
     from_: str = Field(alias="from")
-    to: str
+    to: str | list[str]
 
     model_config = {"populate_by_name": True}
 
@@ -157,6 +157,7 @@ class SystemConfigResponse(BaseModel):
     enable_nine_router_model_override: bool = False
     nine_router_model_override_rules: list[ModelOverrideRule] = []
     nine_router_model_override_default: str = "auto"
+    enable_nine_router_direct: bool = False
 
 
 class SystemConfigUpdate(BaseModel):
@@ -167,6 +168,7 @@ class SystemConfigUpdate(BaseModel):
     enable_nine_router_model_override: bool | None = None
     nine_router_model_override_rules: list[ModelOverrideRule] | None = None
     nine_router_model_override_default: str | None = None
+    enable_nine_router_direct: bool | None = None
 
 
 # --- Models ---

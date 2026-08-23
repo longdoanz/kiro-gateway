@@ -42,15 +42,52 @@ class OverrideConfig:
     has_default: bool = False
 
 
-def resolve_model(model: str, config: OverrideConfig) -> str:
+def _normalize_targets(rule: dict) -> List[str]:
     """
-    Pure function — no I/O. Returns the overridden model name.
+    Normalize a rule's `to` field into an ordered list of target models.
 
-    Normalizes model to lowercase, iterates rules (first substring match wins),
-    falls back to config.default_model if no rule matches.
+    Accepts the legacy single-target form (``"to": "model"``) and the new
+    multi-level form (``"to": ["model1", "model2"]``). Empty / non-string
+    entries are dropped. Returns an empty list when no target is configured.
+
+    Args:
+        rule: A single override rule dict.
+
+    Returns:
+        Ordered list of non-empty target model strings.
+    """
+    raw = rule.get("to")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw.strip()] if raw.strip() else []
+    if isinstance(raw, list):
+        return [str(t).strip() for t in raw if isinstance(t, str) and t.strip()]
+    return []
+
+
+def resolve_models(model: str, config: OverrideConfig) -> List[str]:
+    """
+    Pure function — no I/O. Returns the ordered list of candidate models to try.
+
+    The list is the failover order: the first entry is tried first, and each
+    subsequent entry is a fallback used when the upstream call for the previous
+    entry fails.
+
+    Normalizes model to lowercase, iterates rules (first substring match wins).
+    A matching rule yields its ordered targets (legacy single ``to`` or new
+    multi-level ``to`` list). With no matching rule, the default is applied when
+    configured; otherwise the original model is passed through unchanged.
+
+    Args:
+        model: The original (client-supplied) model name.
+        config: The override configuration.
+
+    Returns:
+        Ordered list of one or more candidate model names.
     """
     if not config.enabled:
-        return model
+        return [model]
 
     from kiro.model_resolver import normalize_model_name
     normalized = normalize_model_name(model).lower()
@@ -58,10 +95,12 @@ def resolve_model(model: str, config: OverrideConfig) -> str:
     for rule in config.rules:
         from_pattern = (rule.get("from") or "").lower().strip()
         if from_pattern and from_pattern in normalized:
-            target = rule.get("to") or model
-            if model != target:
-                logger.debug(f"Model override rule '{from_pattern}': {model} -> {target}")
-            return target
+            targets = _normalize_targets(rule)
+            if not targets:
+                targets = [model]
+            if model != targets[0]:
+                logger.debug(f"Model override rule '{from_pattern}': {model} -> {targets}")
+            return targets
 
     # No rule matched — apply default.
     # `default` may be the literal model name "auto" (a real model in 9router),
@@ -71,9 +110,21 @@ def resolve_model(model: str, config: OverrideConfig) -> str:
     if config.has_default or default != "auto":
         if model != default:
             logger.debug(f"Model override default: {model} -> {default}")
-            return default
+            return [default]
 
-    return model
+    return [model]
+
+
+def resolve_model(model: str, config: OverrideConfig) -> str:
+    """
+    Pure function — no I/O. Returns the single overridden model name.
+
+    Backward-compatible wrapper around :func:`resolve_models` that returns only
+    the first (highest-priority) candidate. Existing callers that rewrite a
+    model string once keep working unchanged; multi-level failover callers use
+    :func:`resolve_models` directly.
+    """
+    return resolve_models(model, config)[0]
 
 
 async def get_override_config() -> OverrideConfig:
