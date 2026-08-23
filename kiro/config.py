@@ -555,6 +555,12 @@ ACCOUNTS_STATE_FILE: str = os.getenv("ACCOUNTS_STATE_FILE", "state.json")
 # When set, all-accounts-exhausted errors fall back to 9router instead of returning 503
 NINE_ROUTER_URL: str = os.getenv("NINE_ROUTER_URL", "")
 
+# Direct mode — route every request straight to 9router, bypassing the Kiro
+# account/key pool entirely. This is the env fallback; the DB-backed toggle
+# (`enable_nine_router_direct`) takes precedence when the dashboard DB is
+# configured. See kiro.nine_router_client.is_nine_router_direct_enabled().
+ENABLE_NINE_ROUTER_DIRECT: bool = os.getenv("ENABLE_NINE_ROUTER_DIRECT", "false").lower() in ("true", "1", "yes")
+
 # API key for 9router's /v1/* endpoints (REQUIRE_API_KEY=true in 9router)
 NINE_ROUTER_API_KEY: str = os.getenv("NINE_ROUTER_API_KEY", "")
 

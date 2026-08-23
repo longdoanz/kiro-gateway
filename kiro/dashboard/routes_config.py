@@ -19,10 +19,12 @@ CONFIG_DEFAULTS = {
     "enable_nine_router_model_override": "false",
     "nine_router_model_override_rules": "[]",
     "nine_router_model_override_default": "auto",
+    "enable_nine_router_direct": "false",
 }
 
 _OVERRIDE_KEYS = {"enable_model_override", "model_override_rules", "model_override_default"}
 _NINE_ROUTER_OVERRIDE_KEYS = {"enable_nine_router_model_override", "nine_router_model_override_rules", "nine_router_model_override_default"}
+_NINE_ROUTER_DIRECT_KEYS = {"enable_nine_router_direct"}
 
 
 def _to_response(raw: dict[str, str]) -> SystemConfigResponse:
@@ -38,6 +40,7 @@ def _to_response(raw: dict[str, str]) -> SystemConfigResponse:
         enable_nine_router_model_override=merged["enable_nine_router_model_override"].lower() == "true",
         nine_router_model_override_rules=nr_rules_raw,
         nine_router_model_override_default=merged.get("nine_router_model_override_default", "auto"),
+        enable_nine_router_direct=merged["enable_nine_router_direct"].lower() == "true",
     )
 
 
@@ -68,4 +71,7 @@ async def update_config_route(body: SystemConfigUpdate, admin: User = Depends(re
     if _NINE_ROUTER_OVERRIDE_KEYS & set(updates.keys()):
         from kiro.nine_router_client import invalidate_nine_router_override_cache
         invalidate_nine_router_override_cache()
+    if _NINE_ROUTER_DIRECT_KEYS & set(updates.keys()):
+        from kiro.nine_router_client import invalidate_nine_router_direct_cache
+        invalidate_nine_router_direct_cache()
     return _to_response(raw)

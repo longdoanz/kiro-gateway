@@ -55,7 +55,7 @@ from kiro.utils import generate_conversation_id
 from kiro.tokenizer import estimate_request_tokens
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
-from kiro.nine_router_client import forward_to_nine_router, is_nine_router_enabled
+from kiro.nine_router_client import forward_to_nine_router, is_nine_router_enabled, is_nine_router_direct_enabled
 
 # Import debug_logger
 try:
@@ -167,6 +167,15 @@ async def messages(
 
     if anthropic_version:
         logger.debug(f"Anthropic API version: {anthropic_version}")
+
+    # Direct-to-9router mode: bypass the Kiro account/key pool entirely and
+    # forward the raw request to 9router as the primary upstream. This covers
+    # both account mode and API_KEY_MODE (checked before the delegation below).
+    if await is_nine_router_direct_enabled():
+        from kiro.api_key_mode import get_api_key_from_request, _resolve_gateway_key_id_only, _make_nine_router_usage_cb
+        _raw_token = get_api_key_from_request(request)
+        _gw_id = await _resolve_gateway_key_id_only(_raw_token)
+        return await forward_to_nine_router(request, await request.body(), on_usage=_make_nine_router_usage_cb(_gw_id))
 
     # In API_KEY_MODE, delegate to the dedicated handler
     if API_KEY_MODE:
