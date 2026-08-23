@@ -44,6 +44,22 @@ from kiro.utils import get_kiro_headers
 from kiro.network_errors import classify_network_error, get_short_error_message, NetworkErrorInfo
 
 
+async def _safe_aclose(response: Optional[httpx.Response]) -> None:
+    """Close a response, returning its connection to the pool.
+
+    Required whenever a streaming response is abandoned without fully reading
+    its body — e.g. before retrying. Otherwise the connection never returns to
+    the shared pool and accumulates as CLOSE_WAIT sockets until the pool is
+    exhausted (PoolTimeout on subsequent requests).
+    """
+    if response is None:
+        return
+    try:
+        await response.aclose()
+    except Exception:
+        pass
+
+
 class KiroHttpClient:
     """
     HTTP client for Kiro API with retry logic support.
@@ -239,23 +255,28 @@ class KiroHttpClient:
                 
                 # 403 - token expired, refresh and retry
                 if response.status_code == 403:
+                    await _safe_aclose(response)
                     logger.warning(f"Received 403, refreshing token (attempt {attempt + 1}/{MAX_RETRIES})")
                     await self.auth_manager.force_refresh()
                     continue
-                
+
                 # 429 - rate limit, wait and retry
                 if response.status_code == 429:
                     last_response = response  # Сохраняем для возврата после exhaustion
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received 429, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        await _safe_aclose(response)
                     await asyncio.sleep(delay)
                     continue
-                
+
                 # 5xx - server error, wait and retry
                 if 500 <= response.status_code < 600:
                     last_response = response  # Сохраняем для возврата после exhaustion
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"Received {response.status_code}, waiting {delay}s (attempt {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        await _safe_aclose(response)
                     await asyncio.sleep(delay)
                     continue
                 

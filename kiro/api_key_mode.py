@@ -636,6 +636,7 @@ async def _read_error_response(response, http_client: "ApiKeyModeClient") -> str
         error_content = await response.aread()
     except Exception:
         error_content = b"Unknown error"
+    await _release_response(response)
     await http_client.close()
     error_text = error_content.decode("utf-8", errors="replace")
     try:
@@ -646,6 +647,20 @@ async def _read_error_response(response, http_client: "ApiKeyModeClient") -> str
     except (json.JSONDecodeError, KeyError):
         pass
     return error_text
+
+
+async def _release_response(response: "httpx.Response") -> None:
+    """Close a response, returning its connection to the pool.
+
+    Required whenever we abandon a streaming response without fully reading
+    its body — e.g. before retrying or falling back. Without this, the
+    connection is never returned to the shared pool and accumulates as
+    CLOSE_WAIT sockets until the pool is exhausted (PoolTimeout).
+    """
+    try:
+        await response.aclose()
+    except Exception:
+        pass
 
 
 async def _track_all_usage(
@@ -817,6 +832,7 @@ class ApiKeyModeClient:
 
                 if response.status_code == 403:
                     # User-supplied token is invalid — do not retry
+                    await _release_response(response)
                     logger.warning("ApiKeyModeClient: received 403, user-supplied Kiro API key is invalid")
                     if self.key_id is not None and is_db_configured():
                         # Update cache immediately so subsequent requests don't reuse this key
@@ -841,10 +857,12 @@ class ApiKeyModeClient:
                             pass
                     switched = await self._try_switch_key_on_429()
                     if not switched:
-                        return response  # no fallback available, propagate 402
+                        return response  # no fallback available, propagate 402 (body still needed by caller)
+                    await _release_response(response)
                     continue  # retry immediately with new key
 
                 if response.status_code == 429:
+                    await _release_response(response)
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"ApiKeyModeClient: 429 rate-limit, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
                     await self._try_switch_key_on_429()
@@ -852,6 +870,7 @@ class ApiKeyModeClient:
                     continue
 
                 if 500 <= response.status_code < 600:
+                    await _release_response(response)
                     delay = BASE_RETRY_DELAY * (2 ** attempt)
                     logger.warning(f"ApiKeyModeClient: {response.status_code} server error, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
                     await asyncio.sleep(delay)
@@ -1073,6 +1092,7 @@ async def handle_chat_openai(request: Request, request_data: Any) -> Any:
             if response.status_code == 402:
                 from kiro.nine_router_client import forward_to_nine_router, is_nine_router_enabled
                 if is_nine_router_enabled():
+                    await _release_response(response)
                     await http_client.close()
                     logger.warning("[API_KEY_MODE/OpenAI] All keys quota-exhausted, falling back to 9router")
                     return await forward_to_nine_router(
@@ -1242,6 +1262,7 @@ async def handle_chat_anthropic(request: Request, request_data: Any, anthropic_v
             if response.status_code == 402:
                 from kiro.nine_router_client import forward_to_nine_router, is_nine_router_enabled
                 if is_nine_router_enabled():
+                    await _release_response(response)
                     await http_client.close()
                     logger.warning("[API_KEY_MODE/Anthropic] All keys quota-exhausted, falling back to 9router")
                     return await forward_to_nine_router(
